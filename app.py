@@ -1,13 +1,19 @@
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, redirect, url_for
 import sqlite3
 import bcrypt
 import jwt
 import datetime
 from functools import wraps
+import os
+from dotenv import load_dotenv
 
 app = Flask(__name__)
-DATABASE = 'database.db'
-SECRET_KEY = 'sua_chave_secreta'  # Substitua por uma chave secreta mais segura em produção
+
+# Carrega as variáveis de ambiente
+load_dotenv()
+
+DATABASE = os.getenv('DATABASE_URL')
+SECRET_KEY = os.getenv('SECRET_KEY')
 
 # Função para inicializar o banco de dados e criar as tabelas se não existirem
 def init_db():
@@ -16,7 +22,8 @@ def init_db():
     cursor.execute('''CREATE TABLE IF NOT EXISTS usuarios (
                       id INTEGER PRIMARY KEY AUTOINCREMENT,
                       username TEXT UNIQUE,
-                      password TEXT
+                      password TEXT,
+                      role TEXT
                       )''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS dados_sensores (
                       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,7 +38,7 @@ def init_db():
 # Inicializando o banco de dados na inicialização do servidor
 init_db()
 
-# Função para autenticar JWT
+# Função para autenticar JWT e adicionar a role ao request
 def authenticateJWT(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -45,25 +52,40 @@ def authenticateJWT(f):
         try:
             data = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
             request.user_id = data['userId']
-        except:
-            return jsonify({"message": "Acesso negado"}), 403
+            request.role = data['role'] 
+        except jwt.ExpiredSignatureError:
+            return jsonify({"message": "Token expirado"}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({"message": "Token inválido"}), 403
 
         return f(*args, **kwargs)
     return decorated
 
-# Rota para cadastrar um novo usuário
+# Função para verificar se o usuário tem a role necessária
+def role_required(role):
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if request.role != role:
+                return jsonify({"message": "Acesso negado, role insuficiente"}), 403
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+# Rota para cadastrar um novo usuário (admin ou user)
 @app.route('/register', methods=['POST'])
 def register():
     data = request.get_json()
     username = data['username']
     password = data['password']
+    role = data.get('role', 'user')  # Role padrão : 'user'
 
     hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
     
     try:
-        cursor.execute('INSERT INTO usuarios (username, password) VALUES (?, ?)', (username, hashed_password))
+        cursor.execute('INSERT INTO usuarios (username, password, role) VALUES (?, ?, ?)', (username, hashed_password, role))
         conn.commit()
         return jsonify({"message": "Usuário cadastrado com sucesso"}), 201
     except sqlite3.IntegrityError:
@@ -85,16 +107,22 @@ def login():
         user = cursor.fetchone()
         conn.close()
 
-        # A senha está em bytes, não é necessário usar encode() novamente
-        if user and bcrypt.checkpw(password.encode('utf-8'), user[2]):  # user[2] já é bytes
-            token = jwt.encode({'userId': user[0], 'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=1)}, SECRET_KEY, algorithm="HS256")
+        if user and bcrypt.checkpw(password.encode('utf-8'), user[2]):
+            token = jwt.encode(
+                {
+                    'userId': user[0], 
+                    'role': user[3], 
+                    'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+                }, 
+                SECRET_KEY, 
+                algorithm="HS256"
+            )
             return jsonify({"message": "Login realizado com sucesso", "token": token})
         
         return jsonify({"message": "Usuário ou senha incorretos"}), 400
     except Exception as e:
-        print(f"Erro no login: {str(e)}")  # Imprime o erro no console
+        print(f"Erro no login: {str(e)}")
         return jsonify({"message": "Erro interno no servidor"}), 500
-
 
 # Middleware para validação dos dados do sensor
 def validar_dados_sensor(f):
@@ -117,7 +145,7 @@ def validar_dados_sensor(f):
         return f(*args, **kwargs)
     return decorated
 
-# Endpoint para inserir dados (POST)
+# Endpoint para inserir dados (POST) - acessível para admin e user
 @app.route('/dados-sensores', methods=['POST'])
 @authenticateJWT
 @validar_dados_sensor
@@ -131,9 +159,10 @@ def inserir_dados():
     conn.close()
     return jsonify({"message": "Dados inseridos com sucesso"}), 201
 
-# Endpoint para buscar todos os dados (GET)
+# Endpoint para buscar todos os dados (GET) - acessível apenas para admin
 @app.route('/dados-sensores', methods=['GET'])
 @authenticateJWT
+@role_required('admin')
 def buscar_dados():
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
@@ -142,9 +171,10 @@ def buscar_dados():
     conn.close()
     return jsonify(rows)
 
-# Endpoint para limpar todos os dados da tabela (DELETE)
+# Endpoint para limpar todos os dados da tabela (DELETE) - acessível apenas para admin
 @app.route('/limpar-dados', methods=['DELETE'])
 @authenticateJWT
+@role_required('admin')
 def limpar_dados():
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
@@ -153,9 +183,8 @@ def limpar_dados():
     conn.close()
     return jsonify({"message": "Dados limpos com sucesso"}), 200
 
-# Endpoint para fornecer dados JSON para gráficos
-@app.route('/dados-sensores-json')
-@authenticateJWT
+# Endpoint para fornecer dados JSON para gráficos - acessível para admin e user
+@app.route('/dados-sensores-json', methods=['GET'])
 def dados_sensores_json():
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
@@ -173,7 +202,7 @@ def dados_sensores_json():
         'umidade': umidades
     })
 
-# Rota para a página principal
+# Rota para a página principal - acessível para todos
 @app.route('/')
 def index():
     conn = sqlite3.connect(DATABASE)
@@ -183,10 +212,10 @@ def index():
     conn.close()
     return render_template('index.html', dados=dados)
 
-# Rota para a exibição de gráficos
+# Rota para a exibição de gráficos - acessível para todos
 @app.route('/graficos')
 def graficos():
-    return render_template('graficos.html') 
+    return render_template('graficos.html')
 
 # Inicia o servidor Flask
 if __name__ == '__main__':

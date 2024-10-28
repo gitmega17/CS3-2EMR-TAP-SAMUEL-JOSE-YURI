@@ -8,7 +8,7 @@ if defined _OLD_CODEPAGE (
     "%SystemRoot%\System32\chcp.com" 65001 > nul
 )
 
-set VIRTUAL_ENV=C:\Users\PC DESENHO WIN NONO\Documents\dados-sensores-flask-python-main\venv
+set VIRTUAL_ENV=C:\Users\PC DESENHO WIN NONO\Documents\CS3-2EMR-TAP-SAMUEL-JOSE-YURI\venv
 
 if not defined PROMPT set PROMPT=$P$G
 
